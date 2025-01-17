@@ -1,215 +1,166 @@
 use starknet::ContractAddress;
- 
-// In order to make contract calls within our Vault,
-// we need to have the interface of the remote ERC20 contract defined to import the Dispatcher.
+
 #[starknet::interface]
-pub trait IERC20<TContractState> {
-    fn get_name(self: @TContractState) -> felt252;
-    fn get_symbol(self: @TContractState) -> felt252;
-    fn get_decimals(self: @TContractState) -> u8;
-    fn get_total_supply(self: @TContractState) -> felt252;
-    fn balance_of(self: @TContractState, account: ContractAddress) -> felt252;
-    fn allowance(
-        self: @TContractState, owner: ContractAddress, spender: ContractAddress,
-    ) -> felt252;
-    fn transfer(ref self: TContractState, recipient: ContractAddress, amount: felt252);
-    fn transfer_from(
-        ref self: TContractState,
-        sender: ContractAddress,
-        recipient: ContractAddress,
-        amount: felt252,
-    );
-    fn approve(ref self: TContractState, spender: ContractAddress, amount: felt252);
-    fn increase_allowance(ref self: TContractState, spender: ContractAddress, added_value: felt252);
-    fn decrease_allowance(
-        ref self: TContractState, spender: ContractAddress, subtracted_value: felt252,
-    );
+trait ISimpleVaultFactory<TContractState> {
+    fn create_vault(ref self: TContractState, token: ContractAddress) -> ContractAddress;
+    fn get_vault_count(self: @TContractState) -> u256;
+    fn get_vault_by_index(self: @TContractState, index: u256) -> ContractAddress;
+    fn get_vault_by_token(self: @TContractState, token: ContractAddress) -> ContractAddress;
 }
- 
-#[starknet::interface]
-pub trait ISimpleVault<TContractState> {
-    fn deposit(ref self: TContractState, amount: u256);
-    fn withdraw(ref self: TContractState, shares: u256);
-    fn user_balance_of(ref self: TContractState, account: ContractAddress) -> u256;
-    fn contract_total_supply(ref self: TContractState) -> u256;
-}
- 
+
 #[starknet::contract]
-pub mod SimpleVault {
-    use super::{IERC20Dispatcher, IERC20DispatcherTrait};
-    use starknet::{ContractAddress, get_caller_address, get_contract_address};
+mod SimpleVaultFactory {
+    use starknet::{
+        ContractAddress,
+        contract_address_const,
+        ClassHash,
+        syscalls::deploy_syscall,
+    };
     use starknet::storage::{
         Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
         StoragePointerWriteAccess,
     };
- 
+
     #[storage]
     struct Storage {
-        token: IERC20Dispatcher,
-        total_supply: u256,
-        balance_of: Map<ContractAddress, u256>,
+        vault_class_hash: ClassHash,
+        vault_count: u256,
+        vaults: Map<u256, ContractAddress>,
+        token_to_vault: Map<ContractAddress, ContractAddress>,
     }
- 
+
     #[constructor]
-    fn constructor(ref self: ContractState, token: ContractAddress) {
-        self.token.write(IERC20Dispatcher { contract_address: token });
+    fn constructor(ref self: ContractState, vault_class_hash: ClassHash) {
+        self.vault_class_hash.write(vault_class_hash);
+        self.vault_count.write(0);
     }
- 
+
     #[generate_trait]
     impl PrivateFunctions of PrivateFunctionsTrait {
-        fn _mint(ref self: ContractState, to: ContractAddress, shares: u256) {
-            self.total_supply.write(self.total_supply.read() + shares);
-            self.balance_of.write(to, self.balance_of.read(to) + shares);
-        }
- 
-        fn _burn(ref self: ContractState, from: ContractAddress, shares: u256) {
-            self.total_supply.write(self.total_supply.read() - shares);
-            self.balance_of.write(from, self.balance_of.read(from) - shares);
+        fn _create_vault(
+            ref self: ContractState,
+            token: ContractAddress,
+        ) -> ContractAddress {
+            // Deploy new vault
+            let (vault_address, _) = deploy_syscall(
+                self.vault_class_hash.read(),
+                0,
+                array![token.into()].span(),
+                false
+            ).unwrap();
+
+            // Update storage
+            let current_count = self.vault_count.read();
+            self.vaults.write(current_count, vault_address);
+            self.token_to_vault.write(token, vault_address);
+            self.vault_count.write(current_count + 1.into());
+
+            vault_address
         }
     }
- 
+
     #[abi(embed_v0)]
-    impl SimpleVault of super::ISimpleVault<ContractState> {
-        fn user_balance_of(ref self: ContractState, account: ContractAddress) -> u256 {
-            self.balance_of.read(account)
-        }
- 
-        fn contract_total_supply(ref self: ContractState) -> u256 {
-            self.total_supply.read()
-        }
- 
-        fn deposit(ref self: ContractState, amount: u256) {
-            // a = amount
-            // B = balance of token before deposit
-            // T = total supply
-            // s = shares to mint
-            //
-            // (T + s) / T = (a + B) / B
-            //
-            // s = aT / B
-            let caller = get_caller_address();
-            let this = get_contract_address();
- 
-            let mut shares = 0;
-            if self.total_supply.read() == 0 {
-                shares = amount;
-            } else {
-                let balance: u256 = self.token.read().balance_of(this).try_into().unwrap();
-                shares = (amount * self.total_supply.read()) / balance;
+    impl SimpleVaultFactory of super::ISimpleVaultFactory<ContractState> {
+        fn create_vault(ref self: ContractState, token: ContractAddress) -> ContractAddress {
+            // Check if vault already exists for this token
+            let existing_vault = self.token_to_vault.read(token);
+            if existing_vault != contract_address_const::<0>() {
+                return existing_vault;
             }
- 
-            PrivateFunctions::_mint(ref self, caller, shares);
- 
-            let amount_felt252: felt252 = amount.low.into();
-            self.token.read().transfer_from(caller, this, amount_felt252);
+
+            // Create new vault
+            PrivateFunctions::_create_vault(ref self, token)
         }
- 
-        fn withdraw(ref self: ContractState, shares: u256) {
-            // a = amount
-            // B = balance of token before withdraw
-            // T = total supply
-            // s = shares to burn
-            //
-            // (T - s) / T = (B - a) / B
-            //
-            // a = sB / T
-            let caller = get_caller_address();
-            let this = get_contract_address();
- 
-            let balance = self.user_balance_of(this);
-            let amount = (shares * balance) / self.total_supply.read();
-            PrivateFunctions::_burn(ref self, caller, shares);
-            let amount_felt252: felt252 = amount.low.into();
-            self.token.read().transfer(caller, amount_felt252);
+
+        fn get_vault_count(self: @ContractState) -> u256 {
+            self.vault_count.read()
+        }
+
+        fn get_vault_by_index(self: @ContractState, index: u256) -> ContractAddress {
+            assert(index < self.vault_count.read(), 'Invalid vault index');
+            self.vaults.read(index)
+        }
+
+        fn get_vault_by_token(self: @ContractState, token: ContractAddress) -> ContractAddress {
+            self.token_to_vault.read(token)
         }
     }
 }
- 
-// TODO migrate to sn-foundry
+
 #[cfg(test)]
 mod tests {
-    use super::{SimpleVault, ISimpleVaultDispatcher, ISimpleVaultDispatcherTrait};
-    use erc20::token::{
-        IERC20DispatcherTrait as IERC20DispatcherTrait_token,
-        IERC20Dispatcher as IERC20Dispatcher_token,
+    use super::SimpleVaultFactory;
+    use starknet::{
+        ContractAddress, 
+        contract_address_const,
+        ClassHash,
+        syscalls::deploy_syscall
     };
-    use starknet::testing::{set_contract_address, set_account_contract_address};
-    use starknet::{ContractAddress, syscalls::deploy_syscall, contract_address_const};
- 
-    const token_name: felt252 = 'myToken';
-    const decimals: u8 = 18;
-    const initial_supply: felt252 = 100000;
-    const symbols: felt252 = 'mtk';
- 
-    fn deploy() -> (ISimpleVaultDispatcher, ContractAddress, IERC20Dispatcher_token) {
-        let _token_address: ContractAddress = contract_address_const::<'token_address'>();
+    use starknet::testing::set_contract_address;
+
+    // Mock class hash for testing
+    const MOCK_CLASS_HASH: felt252 = 123456;
+
+    #[test]
+    fn test_create_vault() {
         let caller = contract_address_const::<'caller'>();
- 
-        let (token_contract_address, _) = deploy_syscall(
-            erc20::token::erc20::TEST_CLASS_HASH.try_into().unwrap(),
-            caller.into(),
-            array![caller.into(), token_name, decimals.into(), initial_supply, symbols].span(),
-            false,
-        )
-            .expect('1');
- 
-        let (contract_address, _) = deploy_syscall(
-            SimpleVault::TEST_CLASS_HASH.try_into().unwrap(),
+        set_contract_address(caller);
+
+        // Deploy factory with mock vault class hash
+        let (factory_address, _) = deploy_syscall(
+            SimpleVaultFactory::TEST_CLASS_HASH.try_into().unwrap(),
             0,
-            array![token_contract_address.into()].span(),
-            false,
-        )
-            .expect('2');
- 
-        (
-            ISimpleVaultDispatcher { contract_address },
-            contract_address,
-            IERC20Dispatcher_token { contract_address: token_contract_address },
-        )
+            array![MOCK_CLASS_HASH].span(),
+            false
+        ).unwrap();
+
+        // Create dispatcher
+        let dispatcher = ISimpleVaultFactoryDispatcher { contract_address: factory_address };
+        
+        let token_address = contract_address_const::<'token'>();
+
+        // Create vault
+        let vault_address = dispatcher.create_vault(token_address);
+        assert(vault_address != contract_address_const::<0>(), 'Invalid vault address');
+
+        // Verify vault count and mapping
+        assert(dispatcher.get_vault_count() == 1.into(), 'Invalid vault count');
+        assert(
+            dispatcher.get_vault_by_token(token_address) == vault_address,
+            'Invalid vault mapping'
+        );
+        assert(
+            dispatcher.get_vault_by_index(0.into()) == vault_address,
+            'Invalid vault index'
+        );
     }
- 
+
     #[test]
-    fn test_deposit() {
+    fn test_duplicate_vault() {
         let caller = contract_address_const::<'caller'>();
-        let (dispatcher, vault_address, token_dispatcher) = deploy();
- 
-        // Approve the vault to transfer tokens on behalf of the caller
-        let amount: felt252 = 10.into();
-        token_dispatcher.approve(vault_address.into(), amount);
         set_contract_address(caller);
- 
-        // Deposit tokens into the vault
-        let amount: u256 = 10.into();
-        let _deposit = dispatcher.deposit(amount);
-        println!("deposit :{:?}", _deposit);
- 
-        // Check balances and total supply
-        let balance_of_caller = dispatcher.user_balance_of(caller);
-        let total_supply = dispatcher.contract_total_supply();
- 
-        assert_eq!(balance_of_caller, amount);
-        assert_eq!(total_supply, amount);
-    }
- 
-    #[test]
-    fn test_deposit_withdraw() {
-        let caller = contract_address_const::<'caller'>();
-        let (dispatcher, vault_address, token_dispatcher) = deploy();
- 
-        // Approve the vault to transfer tokens on behalf of the caller
-        let amount: felt252 = 10.into();
-        token_dispatcher.approve(vault_address.into(), amount);
-        set_contract_address(caller);
-        set_account_contract_address(vault_address);
- 
-        // Deposit tokens into the vault
-        let amount: u256 = 10.into();
-        dispatcher.deposit(amount);
-        dispatcher.withdraw(amount);
- 
-        // Check balances of user in the vault after withdraw
-        let balance_of_caller = dispatcher.user_balance_of(caller);
- 
-        assert_eq!(balance_of_caller, 0.into());
+
+        // Deploy factory with mock vault class hash
+        let (factory_address, _) = deploy_syscall(
+            SimpleVaultFactory::TEST_CLASS_HASH.try_into().unwrap(),
+            0,
+            array![MOCK_CLASS_HASH].span(),
+            false
+        ).unwrap();
+
+        // Create dispatcher
+        let dispatcher = ISimpleVaultFactoryDispatcher { contract_address: factory_address };
+        
+        let token_address = contract_address_const::<'token'>();
+
+        // Create first vault
+        let vault_address1 = dispatcher.create_vault(token_address);
+        
+        // Try to create duplicate vault
+        let vault_address2 = dispatcher.create_vault(token_address);
+
+        // Verify same vault is returned
+        assert(vault_address1 == vault_address2, 'Different vault returned');
+        assert(dispatcher.get_vault_count() == 1.into(), 'Invalid vault count');
     }
 }
