@@ -51,6 +51,11 @@ pub trait IOptionVault<TContractState> {
     fn get_next_option_id(self: @TContractState) -> u256;
     fn get_total_locked_amount(self: @TContractState) -> u256;
     fn get_user_total_deposits(self: @TContractState, user: ContractAddress) -> u256;
+    fn buy_option(
+        ref self: TContractState, 
+        option_id: u256, 
+        amount: u256
+    );
 }
  
 #[starknet::contract]
@@ -286,6 +291,52 @@ pub mod OptionVault {
 
         fn get_user_total_deposits(self: @ContractState, user: ContractAddress) -> u256 {
             self.user_total_deposits.read(user)
+        }
+
+        fn buy_option(
+            ref self: ContractState, 
+            option_id: u256, 
+            amount: u256
+        ) {
+            // Get option details
+            let mut option = self.options.read(option_id);
+            
+            // Validate option state
+            assert(!option.exercised, 'Option already exercised');
+            assert(!option.cancelled, 'Option cancelled');
+            // Ensure requested amount doesn't exceed the available option amount
+            assert(amount <= option.amount, 'Amount exceeds available');
+            
+            let current_block = get_block_number();
+            assert(
+                current_block <= option.creation_block + option.expiry_blocks,
+                'Option expired'
+            );
+
+            let caller = get_caller_address();
+            let this = get_contract_address();
+
+            // Calculate and collect payment
+            let payment = amount * option.strike_price;
+            let payment_felt: felt252 = payment.try_into().unwrap();
+            
+            // Transfer payment from buyer to vault
+            self.token.read().transfer_from(caller, this, payment_felt);
+
+            // Update option state
+            if amount == option.amount {
+                option.exercised = true;
+                self.total_locked_amount.write(self.total_locked_amount.read() - amount);
+            } else {
+                option.amount -= amount;
+                self.total_locked_amount.write(self.total_locked_amount.read() - amount);
+            }
+            
+            // Transfer tokens to buyer
+            let amount_felt: felt252 = amount.try_into().unwrap();
+            self.token.read().transfer(caller, amount_felt);
+
+            self.options.write(option_id, option);
         }
     }
 }
