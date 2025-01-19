@@ -38,7 +38,7 @@ struct VaultOption {
 }
  
 #[starknet::interface]
-pub trait ISimpleVault<TContractState> {
+pub trait IOptionVault<TContractState> {
     fn deposit(ref self: TContractState, amount: u256);
     fn withdraw(ref self: TContractState, shares: u256);
     fn user_balance_of(ref self: TContractState, account: ContractAddress) -> u256;
@@ -50,10 +50,11 @@ pub trait ISimpleVault<TContractState> {
     fn get_option_details(self: @TContractState, option_id: u256) -> VaultOption;
     fn get_next_option_id(self: @TContractState) -> u256;
     fn get_total_locked_amount(self: @TContractState) -> u256;
+    fn get_user_total_deposits(self: @TContractState, user: ContractAddress) -> u256;
 }
  
 #[starknet::contract]
-pub mod SimpleVault {
+pub mod OptionVault {
     // use super::{Option}; 
     use super::{VaultOption, IERC20Dispatcher, IERC20DispatcherTrait};
     use starknet::{ContractAddress, get_caller_address, get_contract_address,get_block_number};
@@ -62,7 +63,7 @@ pub mod SimpleVault {
         StoragePointerWriteAccess,
     };
     const LOCK_PERIOD: u64 = 50; // 50 blocks lock period
-    const CREATION_INTERVAL: u64 = 25; // Create options every 25 blocks
+    const CREATION_INTERVAL: u64 = 5; // Create options every 5 blocks
     const LOCK_PERCENTAGE: u256 = 10; // 10% of tokens locked for options
 
 
@@ -76,7 +77,8 @@ pub mod SimpleVault {
         options: Map<u256, VaultOption>,
         next_option_id: u256,
         last_creation_block: u64,
-        total_locked_amount: u256
+        total_locked_amount: u256,
+        user_total_deposits: Map<ContractAddress, u256>,
     }
 
 
@@ -104,7 +106,7 @@ pub mod SimpleVault {
     }
  
     #[abi(embed_v0)]
-    impl SimpleVault of super::ISimpleVault<ContractState> {
+    impl OptionVault of super::IOptionVault<ContractState> {
         fn user_balance_of(ref self: ContractState, account: ContractAddress) -> u256 {
             self.balance_of.read(account)
         }
@@ -135,6 +137,11 @@ pub mod SimpleVault {
  
             PrivateFunctions::_mint(ref self, caller, shares);
  
+            // Track the deposit
+            let current_deposits = self.user_total_deposits.read(caller);
+            self.user_total_deposits.write(caller, current_deposits + amount);
+
+            // Continue with existing deposit logic
             let amount_felt252: felt252 = amount.low.into();
             self.token.read().transfer_from(caller, this, amount_felt252);
         }
@@ -153,6 +160,13 @@ pub mod SimpleVault {
  
             let balance = self.user_balance_of(this);
             let amount = (shares * balance) / self.total_supply.read();
+            
+            // Track the withdrawal
+            let current_deposits = self.user_total_deposits.read(caller);
+            if current_deposits >= amount {
+                self.user_total_deposits.write(caller, current_deposits - amount);
+            }
+
             PrivateFunctions::_burn(ref self, caller, shares);
             let amount_felt252: felt252 = amount.low.into();
             self.token.read().transfer(caller, amount_felt252);
@@ -269,9 +283,10 @@ pub mod SimpleVault {
         fn get_total_locked_amount(self: @ContractState) -> u256 {
             self.total_locked_amount.read()
         }
-      
 
-        
+        fn get_user_total_deposits(self: @ContractState, user: ContractAddress) -> u256 {
+            self.user_total_deposits.read(user)
+        }
     }
 }
  
